@@ -7,8 +7,10 @@
 #
 # What this does:
 # - Collapses whitespace INSIDE TAGS:
-#     • Outside quotes: any \s+ → single space
-#     • Inside quotes: only runs that include a newline → single space
+#     • Outside quotes: collapse any \s+ → single space,
+#       EXCEPT if that run contains a newline and sits immediately before/after '='
+#       (then insert nothing, i.e., no space).
+#     • Inside quotes: collapse only runs that include a newline → single space.
 # - Collapses intra-paragraph newlines in TEXT NODES to spaces,
 #   BUT preserves the entire trailing suffix (newline(s) + indentation) when the
 #   next tag is “structural” (see sets below). This keeps blank lines & layout.
@@ -104,11 +106,28 @@ def tag_has_noreformat(tag: str) -> bool:
     return bool(_HAS_NOREFORMAT.search(tag))
 
 
+def _prev_nonspace(s: str, i: int) -> int:
+    j = i - 1
+    while j >= 0 and s[j].isspace():
+        j -= 1
+    return j
+
+
+def _next_nonspace(s: str, i: int) -> int:
+    j = i
+    n = len(s)
+    while j < n and s[j].isspace():
+        j += 1
+    return j if j < n else -1
+
+
 def normalize_inside_tag(tag: str) -> str:
     """
     Normalize whitespace inside a tag:
-      - Outside quotes: collapse any whitespace runs to single space
-      - Inside quotes: collapse only runs that include a newline to a single space
+      - Outside quotes: collapse any whitespace runs to single space,
+        EXCEPT if the run contains a newline and sits immediately before or after '='
+        (then insert nothing).
+      - Inside quotes: collapse only runs that include a newline to a single space.
     """
     if len(tag) < 2:
         return tag
@@ -148,10 +167,24 @@ def normalize_inside_tag(tag: str) -> str:
                 i += 1
             elif ch.isspace():
                 j = i
+                saw_nl = False
                 while j < n and inner[j].isspace():
+                    if inner[j] == '\n':
+                        saw_nl = True
                     j += 1
-                if not (out and out[-1] == ' '):
-                    out.append(' ')
+
+                # context around this whitespace run
+                p = _prev_nonspace(inner, i)
+                q = _next_nonspace(inner, j)
+
+                if saw_nl and ((p >= 0 and inner[p] == '=') or (q != -1 and inner[q] == '=')):
+                    # Linebreak directly adjacent to '=' → remove whitespace entirely
+                    # (no space insertion)
+                    pass
+                else:
+                    # Default outside-quotes behavior: collapse to single space
+                    if not (out and out[-1] == ' '):
+                        out.append(' ')
                 i = j
             else:
                 out.append(ch)
