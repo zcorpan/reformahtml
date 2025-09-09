@@ -5,54 +5,49 @@
 #   python reformahtml.py input.html              # overwrites input.html in place
 #   python reformahtml.py input.html output.html  # writes to specified output file
 #
-# What this does:
-# - Collapses whitespace INSIDE TAGS:
-#     • Outside quotes: collapse any \s+ → single space,
-#       EXCEPT if that run contains a newline and sits immediately before/after '='
-#       (then insert nothing, i.e., no space).
+# Behavior summary:
+# - Collapses intra-paragraph LFs to spaces while preserving indentation/blank lines
+#   around structural tags and standalone comments.
+# - Inside tags:
+#     • Outside quotes: collapse any \s+ → single space, EXCEPT when a newline-run
+#       sits immediately before/after '=' → insert nothing.
 #     • Inside quotes: collapse only runs that include a newline → single space.
-# - Collapses intra-paragraph newlines in TEXT NODES to spaces,
-#   BUT preserves the entire trailing suffix (newline(s) + indentation) when the
-#   next tag is “structural” (see sets below). This keeps blank lines & layout.
-# - Preserves whitespace-only text nodes exactly (all empty lines/indentation).
-# - Skips everything verbatim within any element carrying data-noreformat.
-# - Leaves comments and <pre>, <textarea>, <script>, <style> as-is.
+# - HTML comments:
+#     • Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
+#         - keep verbatim and treat as a structural boundary (preserve whitespace before it).
+#     • Otherwise: reflow inline (collapse newline-including runs inside the comment).
+# - Elements with data-noreformat: copy their entire subtree verbatim.
+# - Leave <pre>, <textarea>, <script>, <style> content untouched.
 
 import sys
 import re
 from pathlib import Path
 from typing import List
 
-# Raw-text tags (never touch their content)
 RAW_TEXT_TAGS = {"pre", "textarea", "script", "style"}
 
-# Treat these start or end tags as structural boundaries where we must preserve
-# surrounding empty lines / indentation exactly.
+# Structural boundaries (start/end tags that should preserve surrounding whitespace)
 STRUCTURAL_START = {
-    # sectioning / grouping / headings
     "address","article","aside","blockquote","details","dialog","div","dl","dt","dd",
     "fieldset","figcaption","figure","footer","form","h1","h2","h3","h4","h5","h6",
     "header","hgroup","hr","main","menu","nav","ol","p","pre","search","section",
-    # tables & lists & ruby
     "table","thead","tbody","tfoot","tr","td","th","caption","colgroup",
     "ul","li","optgroup","option","ruby","rt","rp"
 }
 STRUCTURAL_END = {
-    # common containers worth preserving before their end tags
     "dl","ol","ul","table","thead","tbody","tfoot","tr","td","th",
     "caption","colgroup","ruby","optgroup","select","p"
 }
 
-# Void elements (not pushed to open stack)
 VOID_ELEMENTS = {
     "area","base","br","col","embed","hr","img","input","link","meta",
     "param","source","track","wbr"
 }
 
-# Text-node collapsing: only collapse runs that contain at least one newline.
+# In text nodes: collapse only runs that include at least one LF
 _TEXT_WS_WITH_NL = re.compile(r"[ \t]*\n+[ \t]*")
 
-# data-noreformat (case-insensitive): skip reformatting in that subtree
+# data-noreformat attribute (case-insensitive)
 _HAS_NOREFORMAT = re.compile(r"\bdata-noreformat\b", re.IGNORECASE)
 
 
@@ -61,7 +56,7 @@ def collapse_nl_runs_to_space(s: str) -> str:
 
 
 def find_tag_end(s: str, i_lt: int) -> int:
-    """Find the index of '>' starting search at position i_lt ('<'), honoring quotes."""
+    """Return index of '>' for a tag starting at i_lt ('<'), respecting quotes."""
     i = i_lt + 1
     n = len(s)
     quote = None
@@ -76,11 +71,11 @@ def find_tag_end(s: str, i_lt: int) -> int:
             elif ch == '>':
                 return i
         i += 1
-    return n - 1  # fallback
+    return n - 1
 
 
 def extract_tag_name(tag: str) -> str:
-    """Return lowercased tag name (for start or end), '' if not found."""
+    """Lowercased tag name (start or end), or '' if not a normal tag."""
     i = 1
     n = len(tag)
     if i < n and tag[i] == '/':
@@ -173,16 +168,13 @@ def normalize_inside_tag(tag: str) -> str:
                         saw_nl = True
                     j += 1
 
-                # context around this whitespace run
                 p = _prev_nonspace(inner, i)
                 q = _next_nonspace(inner, j)
 
                 if saw_nl and ((p >= 0 and inner[p] == '=') or (q != -1 and inner[q] == '=')):
-                    # Linebreak directly adjacent to '=' → remove whitespace entirely
-                    # (no space insertion)
+                    # newline-run touching '=' → no space
                     pass
                 else:
-                    # Default outside-quotes behavior: collapse to single space
                     if not (out and out[-1] == ' '):
                         out.append(' ')
                 i = j
@@ -194,27 +186,64 @@ def normalize_inside_tag(tag: str) -> str:
     return '<' + inner_norm + '>'
 
 
+def _comment_is_standalone(html: str, i_start: int, j_end: int) -> bool:
+    """
+    Return True if the <!-- ... --> at [i_start, j_end+3) is only preceded by
+    whitespace on its line, AND the next character after '-->' is LF.
+    """
+    line_start = html.rfind('\n', 0, i_start) + 1
+    before = html[line_start:i_start]
+    only_ws_before = (before.strip(' \t') == '')
+    next_char = html[j_end+3] if j_end + 3 < len(html) else ''
+    next_is_lf = (next_char == '\n')
+    return only_ws_before and next_is_lf
+
+
+def _reflow_comment_inline(comment_text: str) -> str:
+    """
+    Collapse newline-including whitespace runs inside the comment's content to a single space.
+    Keep other spacing as-is.
+    """
+    inner = comment_text[4:-3]  # strip <!-- -->
+    inner_norm = collapse_nl_runs_to_space(inner)
+    return "<!--" + inner_norm + "-->"
+
+
 def transform(html: str) -> str:
     out: List[str] = []
     i = 0
     n = len(html)
 
-    raw_stack: List[str] = []        # track raw-text contexts
-    noreformat_stack: List[str] = [] # track data-noreformat subtrees
+    raw_stack: List[str] = []        # raw-text contexts
+    noreformat_stack: List[str] = [] # data-noreformat subtree contexts
 
     while i < n:
-        # Comments: copy verbatim
+        # Comments
         if html.startswith('<!--', i):
             j = html.find('-->', i + 4)
             if j == -1:
                 out.append(html[i:])
                 break
-            out.append(html[i:j+3])
+
+            comment_seg = html[i:j+3]
+            standalone = _comment_is_standalone(html, i, j)
+
+            # In raw-text or data-noreformat: always verbatim
+            if raw_stack or noreformat_stack:
+                out.append(comment_seg)
+            else:
+                if standalone:
+                    # Standalone line comment → preserve verbatim
+                    out.append(comment_seg)
+                else:
+                    # Inline comment → reflow inside, no forced newlines
+                    out.append(_reflow_comment_inline(comment_seg))
+
             i = j + 3
             continue
 
+        # Tags
         if html[i] == '<':
-            # Parse tag
             j = find_tag_end(html, i)
             tag = html[i:j+1]
             name = extract_tag_name(tag)
@@ -230,7 +259,6 @@ def transform(html: str) -> str:
             # raw-text tracking
             if name in RAW_TEXT_TAGS:
                 if end_tag:
-                    # pop last matching
                     for k in range(len(raw_stack)-1, -1, -1):
                         if raw_stack[k] == name:
                             del raw_stack[k:]
@@ -238,7 +266,7 @@ def transform(html: str) -> str:
                 elif not self_closing:
                     raw_stack.append(name)
 
-            # data-noreformat subtree tracking
+            # data-noreformat tracking
             if end_tag:
                 if noreformat_stack and noreformat_stack[-1] == name:
                     noreformat_stack.pop()
@@ -269,18 +297,23 @@ def transform(html: str) -> str:
             i = next_lt
             continue
 
-        # Otherwise: possibly preserve trailing suffix if the next tag is structural
+        # Decide whether to preserve the trailing suffix (all trailing LFs/indentation)
         preserve_trailing_suffix = False
-        name_ahead = ''
-        end_ahead = False
         if next_lt != -1:
-            j2 = find_tag_end(html, next_lt)
-            tag_ahead = html[next_lt:j2+1]
-            name_ahead = extract_tag_name(tag_ahead)
-            end_ahead = is_end_tag(tag_ahead)
-            if name_ahead:
-                if (not end_ahead and name_ahead in STRUCTURAL_START) or (end_ahead and name_ahead in STRUCTURAL_END):
+            # Standalone comment ahead? → structural boundary
+            if html.startswith('<!--', next_lt):
+                j2 = html.find('-->', next_lt + 4)
+                if j2 != -1 and _comment_is_standalone(html, next_lt, j2):
                     preserve_trailing_suffix = True
+            else:
+                # Structural start/end tag ahead?
+                j2 = find_tag_end(html, next_lt)
+                tag_ahead = html[next_lt:j2+1]
+                name_ahead = extract_tag_name(tag_ahead)
+                end_ahead = is_end_tag(tag_ahead)
+                if name_ahead:
+                    if (not end_ahead and name_ahead in STRUCTURAL_START) or (end_ahead and name_ahead in STRUCTURAL_END):
+                        preserve_trailing_suffix = True
 
         if preserve_trailing_suffix:
             # Split into head + trailing suffix (all trailing whitespace)
@@ -292,12 +325,10 @@ def transform(html: str) -> str:
                 idx -= 1
             head = chunk[:idx+1]
             suffix = chunk[idx+1:]
-            # collapse only inside the head, keep suffix verbatim
             if head:
                 out.append(collapse_nl_runs_to_space(head))
             out.append(suffix)
         else:
-            # No structural boundary ahead: collapse all newline-containing runs
             out.append(collapse_nl_runs_to_space(chunk))
 
         if next_lt == -1:
