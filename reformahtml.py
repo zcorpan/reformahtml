@@ -10,11 +10,13 @@
 #   around structural tags and standalone comments.
 # - Inside tags:
 #     • Outside quotes: collapse any \s+ → single space, EXCEPT when a newline-run
-#       sits immediately before/after '=' → insert nothing.
+#       sits immediately before/after '=' → insert nothing there.
 #     • Inside quotes: collapse only runs that include a newline → single space.
 # - HTML comments:
 #     • Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
-#         - keep verbatim and treat as a structural boundary (preserve whitespace before it).
+#         - keep verbatim and treat as a structural boundary on BOTH sides:
+#           preserve whitespace before it, and preserve the leading prefix of
+#           the next text node after it (indent + newline(s)).
 #     • Otherwise: reflow inline (collapse newline-including runs inside the comment).
 # - Elements with data-noreformat: copy their entire subtree verbatim.
 # - Leave <pre>, <textarea>, <script>, <style> content untouched.
@@ -39,6 +41,7 @@ STRUCTURAL_END = {
     "caption","colgroup","ruby","optgroup","select","p"
 }
 
+# Void elements (not pushed to open stack)
 VOID_ELEMENTS = {
     "area","base","br","col","embed","hr","img","input","link","meta",
     "param","source","track","wbr"
@@ -214,8 +217,9 @@ def transform(html: str) -> str:
     i = 0
     n = len(html)
 
-    raw_stack: List[str] = []        # raw-text contexts
-    noreformat_stack: List[str] = [] # data-noreformat subtree contexts
+    raw_stack: List[str] = []          # raw-text contexts
+    noreformat_stack: List[str] = []   # data-noreformat subtree contexts
+    after_standalone_comment = False   # preserve leading prefix of NEXT text node
 
     while i < n:
         # Comments
@@ -228,16 +232,15 @@ def transform(html: str) -> str:
             comment_seg = html[i:j+3]
             standalone = _comment_is_standalone(html, i, j)
 
-            # In raw-text or data-noreformat: always verbatim
             if raw_stack or noreformat_stack:
                 out.append(comment_seg)
             else:
                 if standalone:
-                    # Standalone line comment → preserve verbatim
                     out.append(comment_seg)
+                    after_standalone_comment = True  # preserve leading prefix on the next text node
                 else:
-                    # Inline comment → reflow inside, no forced newlines
                     out.append(_reflow_comment_inline(comment_seg))
+                    after_standalone_comment = False
 
             i = j + 3
             continue
@@ -250,7 +253,6 @@ def transform(html: str) -> str:
             end_tag = is_end_tag(tag)
             self_closing = is_self_closing(tag)
 
-            # Emit tag (normalize unless inside data-noreformat)
             if noreformat_stack:
                 out.append(tag)
             else:
@@ -274,6 +276,7 @@ def transform(html: str) -> str:
                 if tag_has_noreformat(tag) and name and name not in VOID_ELEMENTS and not self_closing:
                     noreformat_stack.append(name)
 
+            after_standalone_comment = False  # tags break the "next text node" condition
             i = j + 1
             continue
 
@@ -295,18 +298,17 @@ def transform(html: str) -> str:
             if next_lt == -1:
                 break
             i = next_lt
+            # keep after_standalone_comment True until we see a non-whitespace text node
             continue
 
-        # Decide whether to preserve the trailing suffix (all trailing LFs/indentation)
+        # Decide whether to preserve trailing suffix (all trailing LFs/indentation)
         preserve_trailing_suffix = False
         if next_lt != -1:
-            # Standalone comment ahead? → structural boundary
             if html.startswith('<!--', next_lt):
                 j2 = html.find('-->', next_lt + 4)
                 if j2 != -1 and _comment_is_standalone(html, next_lt, j2):
                     preserve_trailing_suffix = True
             else:
-                # Structural start/end tag ahead?
                 j2 = find_tag_end(html, next_lt)
                 tag_ahead = html[next_lt:j2+1]
                 name_ahead = extract_tag_name(tag_ahead)
@@ -315,21 +317,45 @@ def transform(html: str) -> str:
                     if (not end_ahead and name_ahead in STRUCTURAL_START) or (end_ahead and name_ahead in STRUCTURAL_END):
                         preserve_trailing_suffix = True
 
-        if preserve_trailing_suffix:
-            # Split into head + trailing suffix (all trailing whitespace)
-            idx = len(chunk) - 1
-            has_nl = False
-            while idx >= 0 and chunk[idx] in (' ', '\t', '\n'):
-                if chunk[idx] == '\n':
-                    has_nl = True
-                idx -= 1
-            head = chunk[:idx+1]
-            suffix = chunk[idx+1:]
-            if head:
-                out.append(collapse_nl_runs_to_space(head))
-            out.append(suffix)
+        # Preserve leading prefix if this text immediately follows a standalone comment
+        preserve_leading_prefix = after_standalone_comment
+
+        if preserve_leading_prefix or preserve_trailing_suffix:
+            left = 0
+            right = len(chunk)
+
+            # Leading prefix (all starting whitespace) — emit BEFORE the body
+            prefix = ''
+            if preserve_leading_prefix:
+                while left < right and chunk[left] in (' ', '\t', '\n'):
+                    left += 1
+                prefix = chunk[:left]
+
+            # Trailing suffix (all ending whitespace) — only if it contains at least one newline
+            suffix = ''
+            if preserve_trailing_suffix:
+                idx = right - 1
+                has_nl = False
+                while idx >= left and chunk[idx] in (' ', '\t', '\n'):
+                    if chunk[idx] == '\n':
+                        has_nl = True
+                    idx -= 1
+                if has_nl:
+                    suffix = chunk[idx+1:]
+                    right = idx + 1  # shrink body to exclude suffix
+
+            body = chunk[left:right]
+            # Emit in correct order: prefix, collapsed body, suffix
+            if prefix:
+                out.append(prefix)
+            if body:
+                out.append(collapse_nl_runs_to_space(body))
+            if suffix:
+                out.append(suffix)
         else:
             out.append(collapse_nl_runs_to_space(chunk))
+
+        after_standalone_comment = False  # consumed the "next text node" opportunity
 
         if next_lt == -1:
             break
