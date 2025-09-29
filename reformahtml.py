@@ -5,28 +5,28 @@
 #   python reformahtml.py input.html              # overwrites input.html in place
 #   python reformahtml.py input.html output.html  # writes to specified output file
 #
-# Behavior summary:
+# Behavior summary (highlights):
 # - Collapses intra-paragraph line breaks to spaces while preserving indentation/blank lines
 #   around structural HTML tags and standalone HTML comments.
 # - Inside tags:
-#     • Outside quotes: collapse any \s+ → single space, EXCEPT when a newline-run
-#       sits immediately before/after '=' → insert nothing there.
+#     • Outside quotes: collapse any whitespace runs → single space, EXCEPT when a newline-run
+#       is immediately before/after '=' → insert nothing there.
 #     • Inside quotes: collapse only runs that include a newline → single space.
 # - HTML comments:
 #     • Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
-#         - keep verbatim and treat as a structural boundary on BOTH sides:
-#           preserve whitespace before it, and preserve the leading prefix of
-#           the next text node after it (indent + newline(s)).
+#         keep verbatim and treat as a structural boundary on BOTH sides (also preserves the next
+#         text node’s leading indentation/newlines).
 #     • Otherwise: reflow the comment inline (collapse newline-including runs inside it).
 # - Elements with data-noreformat: copy their entire subtree verbatim.
-# - RAW-TEXT tags (verbatim): pre, textarea, script, style, xmp, wpt
+# - RAW-TEXT tags (verbatim): pre, textarea, script, style, xmp, wpt (kept as atomic blocks).
 # - Bikeshed/Markdown-aware reflow in text nodes (bullets, ordered lists, dt/dd, quotes,
-#   hr, ATX/Setext headings, fenced code blocks).
-# - INLINE start tags at start-of-line (no blank line before) are treated as inline
-#   (single space reflow), except:
-#     • if preceded by a STRUCTURAL_START tag on the previous line → DO NOT reflow.
-# - A <br> at the end of a tag preserves the immediately following '\n' (if present) AND
-#   the leading indentation of the subsequent text node.
+#   hr, ATX/Setext headings, fenced code blocks). List items reflow wrapped lines.
+# - INLINE start tags at start-of-line should reflow into previous text (single space) unless:
+#     • there is a blank line before, or
+#     • the previous line ends with a STRUCTURAL_START tag, or
+#     • we are immediately after a standalone comment or <br>.
+# - <br> preserves an immediately following '\n' (and the next text node’s leading indentation).
+# - Includes 'foreignobject' in STRUCTURAL_START.
 
 import sys
 import re
@@ -50,7 +50,7 @@ STRUCTURAL_START = {
     "header","hgroup","hr","main","menu","nav","ol","p","pre","search","section",
     "table","thead","tbody","tfoot","tr","td","th","caption","colgroup",
     "ul","li","optgroup","option","ruby","rt","rp",
-    "foreignobject"  # added per request
+    "foreignobject"
 }
 STRUCTURAL_END = {
     "dl","ol","ul","table","thead","tbody","tfoot","tr","td","th",
@@ -74,8 +74,8 @@ def _mk_fence_close_re(ch: str, n: int) -> re.Pattern:
     return re.compile(r"^[ \t]*" + re.escape(ch) + r"{" + str(n) + r",}[ \t]*$")
 
 _RE_ATX_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+")
-_RE_BULLET = re.compile(r"^[ \t]*[*-][ \t]+")
-_RE_OL = re.compile(r"^[ \t]*\d+\.[ \t]+")
+_RE_BULLET = re.compile(r"^([ \t]*)([*-])[ \t]+(.*)$")
+_RE_OL = re.compile(r"^([ \t]*)(\d+\.)[ \t]+(.*)$")
 _RE_DT = re.compile(r"^[ \t]*:[ \t]+")
 _RE_DD = re.compile(r"^[ \t]*::[ \t]+")
 _RE_BLOCKQUOTE = re.compile(r"^[ \t]*>[ \t]?")
@@ -144,6 +144,16 @@ def _next_nonspace(s: str, i: int) -> int:
     while j < n and s[j].isspace():
         j += 1
     return j if j < n else -1
+
+def _count_trailing_lfs_ignoring_spaces(s: str) -> int:
+    """Count trailing '\n' in s, ignoring trailing spaces/tabs after them."""
+    t = s.rstrip(' \t')
+    k = 0
+    i = len(t) - 1
+    while i >= 0 and t[i] == '\n':
+        k += 1
+        i -= 1
+    return k
 
 # ---------------- Tag normalization ----------------
 
@@ -232,13 +242,15 @@ def _reflow_comment_inline(comment_text: str) -> str:
 
 def _reflow_markdown_text(text: str) -> str:
     """
-    Bikeshed-flavored Markdown reflow:
+    Bikeshed-flavored Markdown reflow with list handling:
       - Join lines within a paragraph (single newlines) with a single space.
       - Preserve blank lines exactly.
       - Recognize bullets/ol/dt/dd/blockquote/hr/ATX & Setext headings as structural.
+      - Reflow wrapped list items: lines following a list marker that are not blank/structural
+        are joined into the same item with single spaces.
       - Copy fenced code blocks (``` or ~~~) verbatim until the matching close.
-      - IMPORTANT: Preserve edge spaces at paragraph boundaries (do NOT strip the
-        first line's leading spaces or the last line's trailing spaces).
+      - Preserve paragraph separation (do not lose blank lines).
+      - Preserve edge spaces at paragraph boundaries (no trimming that eats spaces around inline HTML).
     """
     if not text:
         return text
@@ -251,12 +263,12 @@ def _reflow_markdown_text(text: str) -> str:
     fence_len = 0
     prev_nonblank_was_paragraph = False
 
-    def flush_para():
+    def flush_para(add_trailing_nl: bool = False):
         nonlocal para_parts, out
         if not para_parts:
             return
         if len(para_parts) == 1:
-            body = para_parts[0]  # keep as-is
+            body = para_parts[0]
         else:
             first = para_parts[0].rstrip(' \t')
             rest = [s.lstrip(' \t') for s in para_parts[1:]]
@@ -264,31 +276,41 @@ def _reflow_markdown_text(text: str) -> str:
             for s in rest:
                 body += ' ' + s
         out.append(body)
+        if add_trailing_nl:
+            out.append('\n')
         para_parts = []
 
-    for raw in lines:
-        line = raw
-        line_no_nl = line.rstrip('\n')
+    i = 0
+    L = len(lines)
+    while i < L:
+        raw = lines[i]
+        had_nl = raw.endswith('\n')
+        line_no_nl = raw[:-1] if had_nl else raw
         line_stripped_ws = line_no_nl.strip()
 
+        # Fenced code blocks
         if in_fence:
             if _mk_fence_close_re(fence_char, fence_len).match(line_no_nl):
                 flush_para()
-                out.append(line)
+                out.append(raw)
                 in_fence = False
                 fence_char = ''
                 fence_len = 0
-                prev_nonblank_was_paragraph = False
             else:
-                out.append(line)
-            continue
-
-        if line_stripped_ws == '':
-            flush_para()
-            out.append(line)
+                out.append(raw)
+            i += 1
             prev_nonblank_was_paragraph = False
             continue
 
+        # Blank line
+        if line_stripped_ws == '':
+            flush_para(add_trailing_nl=True)
+            out.append(raw)  # preserve blank line exactly
+            i += 1
+            prev_nonblank_was_paragraph = False
+            continue
+
+        # Fence open?
         m_f = _RE_FENCE_OPEN.match(line_no_nl)
         if m_f:
             flush_para()
@@ -296,24 +318,70 @@ def _reflow_markdown_text(text: str) -> str:
             fence_char = delim[0]
             fence_len = len(delim)
             in_fence = True
-            out.append(line)
+            out.append(raw)  # opening fence verbatim
+            i += 1
             prev_nonblank_was_paragraph = False
             continue
 
+        # Headings / hr / quotes / dt / dd (structural lines kept verbatim)
         if (_RE_ATX_HEADING.match(line_no_nl) or
-            _RE_BULLET.match(line_no_nl) or
-            _RE_OL.match(line_no_nl) or
-            _RE_DD.match(line_no_nl) or
             _RE_DT.match(line_no_nl) or
+            _RE_DD.match(line_no_nl) or
             _RE_BLOCKQUOTE.match(line_no_nl) or
             _is_hr_line(line_stripped_ws) or
             (_is_setext_underline(line_stripped_ws) and prev_nonblank_was_paragraph)):
-            flush_para()
-            out.append(line)
+            flush_para(add_trailing_nl=True)
+            out.append(raw)
+            i += 1
             prev_nonblank_was_paragraph = False
             continue
 
+        # BULLET or ORDERED LIST ITEM — reflow wrapped continuation lines
+        m_b = _RE_BULLET.match(line_no_nl)
+        m_o = _RE_OL.match(line_no_nl)
+        if m_b or m_o:
+            flush_para(add_trailing_nl=True)
+            indent, marker, first_text = (m_b.groups() if m_b else m_o.groups())
+            item_prefix = f"{indent}{marker} "
+            contents = [first_text]
+
+            j = i + 1
+            while j < L:
+                nxt_raw = lines[j]
+                nxt = nxt_raw[:-1] if nxt_raw.endswith('\n') else nxt_raw
+                nxt_stripped = nxt.strip()
+
+                # Stop on blank line or any structural line (including next list item)
+                if nxt_stripped == '':
+                    break
+                if (_RE_FENCE_OPEN.match(nxt) or
+                    _RE_ATX_HEADING.match(nxt) or
+                    _RE_BULLET.match(nxt) or
+                    _RE_OL.match(nxt) or
+                    _RE_DT.match(nxt) or
+                    _RE_DD.match(nxt) or
+                    _RE_BLOCKQUOTE.match(nxt) or
+                    _is_hr_line(nxt_stripped) or
+                    (_is_setext_underline(nxt_stripped) and True)):
+                    break
+
+                contents.append(nxt.lstrip(' \t'))
+                j += 1
+
+            first = contents[0].rstrip(' \t')
+            rest = [c.lstrip(' \t') for c in contents[1:]]
+            joined = first
+            for c in rest:
+                joined += ' ' + c
+
+            out.append(item_prefix + joined + ('\n' if had_nl else ''))
+            i = j
+            prev_nonblank_was_paragraph = False
+            continue
+
+        # Plain paragraph text: accumulate
         para_parts.append(line_no_nl)
+        i += 1
         prev_nonblank_was_paragraph = True
 
     flush_para()
@@ -321,15 +389,15 @@ def _reflow_markdown_text(text: str) -> str:
 
 # ---------------- Helper for inline-start reflow exception ----------------
 
-def _prev_line_ends_with_structural_start(html: str, chunk_start: int) -> bool:
+def _prev_line_ends_with_structural_start(html: str, boundary_index: int) -> bool:
     """
-    Return True if the line immediately before the whitespace-only chunk ending at chunk_start
-    ends with a STRUCTURAL_START start tag (e.g., <p>, <div>, <dl>, ...).
+    Return True if the line *ending at boundary_index* ends with a STRUCTURAL_START tag.
+    boundary_index should be the index right *after* the newline you're testing.
     """
-    line_start = html.rfind('\n', 0, chunk_start) + 1
-    if line_start == 0 and chunk_start == 0:
+    line_start = html.rfind('\n', 0, boundary_index) + 1
+    if line_start == 0 and boundary_index == 0:
         return False
-    prev_line = html[line_start:chunk_start]
+    prev_line = html[line_start:boundary_index]
     prev_line_rstrip = prev_line.rstrip(' \t')
     if not prev_line_rstrip.endswith('>'):
         return False
@@ -338,9 +406,7 @@ def _prev_line_ends_with_structural_start(html: str, chunk_start: int) -> bool:
         return False
     tag = prev_line_rstrip[lt:]
     name = extract_tag_name(tag)
-    if not name:
-        return False
-    if is_end_tag(tag):
+    if not name or is_end_tag(tag):
         return False
     return name in STRUCTURAL_START
 
@@ -357,6 +423,28 @@ def transform(html: str) -> str:
     after_br = False                   # preserve leading prefix after <br>
 
     while i < n:
+        # If inside a RAW-TEXT element, copy verbatim until its matching end tag.
+        if raw_stack:
+            top = raw_stack[-1]
+            lower_html = html.lower()
+            end_marker = "</" + top + ">"
+            idx = lower_html.find(end_marker, i)
+            if idx == -1:
+                out.append(html[i:])
+                break
+            out.append(html[i:idx])
+            k = html.find('>', idx)
+            if k == -1:
+                out.append(html[idx:])
+                break
+            end_tag_text = html[idx:k+1]
+            out.append(normalize_inside_tag(end_tag_text))
+            raw_stack.pop()
+            after_standalone_comment = False
+            after_br = False
+            i = k + 1
+            continue
+
         # Comments
         if html.startswith('<!--', i):
             j = html.find('-->', i + 4)
@@ -367,12 +455,12 @@ def transform(html: str) -> str:
             comment_seg = html[i:j+3]
             standalone = _comment_is_standalone(html, i, j)
 
-            if raw_stack or noreformat_stack:
+            if noreformat_stack:
                 out.append(comment_seg)
             else:
                 if standalone:
                     out.append(comment_seg)
-                    after_standalone_comment = True  # preserve leading prefix on next text node
+                    after_standalone_comment = True
                 else:
                     out.append(_reflow_comment_inline(comment_seg))
                     after_standalone_comment = False
@@ -413,8 +501,6 @@ def transform(html: str) -> str:
 
             # <br> should preserve a following linebreak (if present)
             if not end_tag and name == 'br':
-                # If there is an immediate LF right after '>', emit it now
-                # and still preserve the leading indentation of the next text node.
                 if j + 1 < n and html[j + 1] == '\n':
                     out.append('\n')
                     i = j + 2
@@ -423,7 +509,7 @@ def transform(html: str) -> str:
                 else:
                     after_br = True
 
-            after_standalone_comment = False  # tags break the comment-next-text condition
+            after_standalone_comment = False
             i = j + 1
             continue
 
@@ -431,8 +517,8 @@ def transform(html: str) -> str:
         next_lt = html.find('<', i)
         chunk = html[i:] if next_lt == -1 else html[i:next_lt]
 
-        # In raw-text or data-noreformat: copy text verbatim
-        if raw_stack or noreformat_stack:
+        # In data-noreformat: copy text verbatim
+        if noreformat_stack:
             out.append(chunk)
             if next_lt == -1:
                 break
@@ -474,13 +560,12 @@ def transform(html: str) -> str:
                     elif ahead_is_inline_start:
                         nl_count = chunk.count('\n')
                         if nl_count == 1:
-                            # EXCEPTION: if the previous line ends with a STRUCTURAL_START tag, DO NOT reflow
-                            if _prev_line_ends_with_structural_start(html, i):
+                            # Evaluate at the boundary (next_lt)
+                            if _prev_line_ends_with_structural_start(html, next_lt):
                                 out.append(chunk)
                             else:
                                 out.append(' ')
                         else:
-                            # blank line (>=2 LFs) → preserve
                             out.append(chunk)
                     else:
                         out.append(chunk)
@@ -513,7 +598,7 @@ def transform(html: str) -> str:
             left = 0
             right = len(chunk)
 
-            # Leading prefix (all starting whitespace) — emit BEFORE the body
+            # Leading prefix (all starting whitespace)
             prefix = ''
             if preserve_leading_prefix:
                 while left < right and chunk[left] in (' ', '\t', '\n'):
@@ -547,7 +632,24 @@ def transform(html: str) -> str:
             lead = m_lead.group(0) if m_lead else ''
             trail = m_trail.group(0) if m_trail else ''
             body = chunk[len(lead): len(chunk) - (len(trail) if trail else 0)]
-            out.append(lead + _reflow_markdown_text(body) + trail)
+
+            # Soft-wrap at the *start* of this chunk (rare case)
+            if (body.startswith('\n') and (len(body) < 2 or body[1] != '\n')
+                and not _prev_line_ends_with_structural_start(html, i)
+                and not after_br and not after_standalone_comment):
+                body = ' ' + body[1:].lstrip(' \t')
+
+            body_reflowed = _reflow_markdown_text(body)
+
+            # If this chunk ends with a single LF (ignoring spaces) and the next token
+            # is an INLINE start tag, collapse that LF (+ any indent) to a single space.
+            trailing_lfs = _count_trailing_lfs_ignoring_spaces(chunk)
+            if ahead_is_inline_start and trailing_lfs == 1 and not _prev_line_ends_with_structural_start(html, i + len(chunk)):
+                # Remove exactly one trailing newline (and any trailing spaces after it) from the body output
+                body_reflowed = re.sub(r"\n[ \t]*$", "", body_reflowed)
+                out.append(lead + body_reflowed + ' ')
+            else:
+                out.append(lead + body_reflowed + trail)
 
         after_standalone_comment = False
         after_br = False  # consumed the preservation for <br>
