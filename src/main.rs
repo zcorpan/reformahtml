@@ -1,24 +1,23 @@
 // src/main.rs
 //
-// reformahtml — fast HTML/Bikeshed reflower
+// reformahtml -- fast HTML/Bikeshed reflower
 //
 // - Collapses intra-paragraph line breaks while preserving indentation/blank lines
 //   around structural HTML tags and standalone comments.
 // - Inside tags:
-//     • Outside quotes: collapse any whitespace runs → single space, EXCEPT when a newline-run
-//       is immediately before/after '=' → insert nothing.
-//     • Inside quotes: collapse only runs that include a newline → single space.
+//     - Outside quotes: collapse any whitespace runs -> single space, EXCEPT when a newline-run
+//       is immediately before/after '=' -> insert nothing.
+//     - Inside quotes: collapse only runs that include a newline -> single space.
 // - HTML comments:
-//     • Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
+//     - Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
 //         keep verbatim and treat as a structural boundary on BOTH sides.
-//     • Otherwise: reflow the comment inline (collapse newline-including runs inside it).
+//     - Otherwise: reflow the comment inline (collapse newline-including runs inside it).
 // - Elements with data-noreformat: copy their entire subtree verbatim.
 // - RAW-TEXT tags (verbatim): pre, textarea, script, style, xmp, wpt.
 // - Bikeshed/Markdown-aware reflow in text nodes (bullets, ordered lists, dt/dd, quotes,
 //   hr, ATX/Setext headings, fenced code blocks). List items and dt/dd items reflow wrapped lines.
 // - INLINE start tags at start-of-line soft-join into previous text unless exceptions apply.
 // - <br> preserves an immediately following '\n'.
-// - 'foreignobject' included in STRUCTURAL_START.
 // - UTF-8 safe.
 //
 // CLI flags:
@@ -87,7 +86,7 @@ fn is_inline(name: &[u8]) -> bool {
         &[
             b"a", b"abbr", b"b", b"bdi", b"bdo", b"cite", b"code", b"data", b"del", b"dfn", b"em",
             b"i", b"ins", b"kbd", b"mark", b"q", b"s", b"samp", b"small", b"span", b"strong",
-            b"sub", b"sup", b"time", b"u", b"var",
+            b"sub", b"sup", b"time", b"u", b"var", b"ref",
         ],
     )
 }
@@ -109,7 +108,7 @@ fn is_raw_text(name: &[u8]) -> bool {
     )
 }
 
-fn is_structural_start(name: &[u8]) -> bool {
+fn is_structural(name: &[u8]) -> bool {
     matches_ignore_ascii_case(
         name,
         &[
@@ -119,16 +118,6 @@ fn is_structural_start(name: &[u8]) -> bool {
             b"nav", b"ol", b"p", b"pre", b"search", b"section", b"table", b"thead", b"tbody",
             b"tfoot", b"tr", b"td", b"th", b"caption", b"colgroup", b"ul", b"li", b"optgroup",
             b"option", b"ruby", b"rt", b"rp", b"foreignobject",
-        ],
-    )
-}
-
-fn is_structural_end(name: &[u8]) -> bool {
-    matches_ignore_ascii_case(
-        name,
-        &[
-            b"dl", b"ol", b"ul", b"table", b"thead", b"tbody", b"tfoot", b"tr", b"td", b"th",
-            b"caption", b"colgroup", b"ruby", b"optgroup", b"select", b"p",
         ],
     )
 }
@@ -979,20 +968,27 @@ fn reflow_text(text: &str, use_markdown: bool) -> String {
 
 /* ==================== Structural boundary helper ======================== */
 
-fn prev_line_ends_with_structural_start(s: &[u8], boundary: usize) -> bool {
-    let line_start = memrchr(b'\n', &s[..boundary]).map(|x| x + 1).unwrap_or(0);
-    if line_start >= boundary { return false; }
-    // Trim trailing spaces/tabs
-    let mut end = boundary;
-    while end > line_start && is_space_tab(s[end - 1]) { end -= 1; }
-    if end <= line_start { return false; }
-    if s[end - 1] != b'>' { return false; }
-    let lt = memrchr(b'<', &s[line_start..end]).map(|x| x + line_start);
-    let lt = match lt { Some(v) => v, None => return false };
-    let tag = &s[lt..end];
-    let ti = parse_tag_info(tag);
-    if ti.is_end { return false; }
-    is_structural_start(ti.name)
+fn prev_line_ends_with_structural_start(s: &[u8], mut boundary: usize) -> bool {
+    loop {
+        let line_start = memrchr(b'\n', &s[..boundary]).map(|x| x + 1).unwrap_or(0);
+        if line_start >= boundary { return false; }
+        let mut end = boundary;
+        while end > line_start && is_space_tab(s[end - 1]) { end -= 1; }
+        if end > line_start {
+            // non-empty after trim
+            if s[end - 1] != b'>' { return false; }
+            let lt = memrchr(b'<', &s[line_start..end]).map(|x| x + line_start);
+            let lt = match lt { Some(v) => v, None => return false };
+            let tag = &s[lt..end];
+            let ti = parse_tag_info(tag);
+            if ti.is_end { return false; }
+            return is_structural(ti.name);
+        } else {
+            // empty line, go back
+            if line_start == 0 { return false; }
+            boundary = line_start - 1; // before the \n
+        }
+    }
 }
 
 fn has_single_lf(chunk: &[u8]) -> bool {
@@ -1097,8 +1093,7 @@ fn reflow_text_chunk(
             if ahead_is_standalone_comment {
                 out.extend_from_slice(chunk);
             } else if let Some(ti) = ahead_tag {
-                let structural_ahead = (!ti.is_end && is_structural_start(ti.name))
-                    || (ti.is_end && is_structural_end(ti.name));
+                let structural_ahead = is_structural(ti.name);
                 if structural_ahead {
                     out.extend_from_slice(chunk);
                 } else if !ti.is_end && is_inline(ti.name) {
@@ -1129,8 +1124,7 @@ fn reflow_text_chunk(
         if ahead_is_standalone_comment {
             preserve_trailing_suffix = true;
         } else if let Some(ti) = ahead_tag {
-            if (!ti.is_end && is_structural_start(ti.name))
-                || (ti.is_end && is_structural_end(ti.name))
+            if is_structural(ti.name)
             {
                 preserve_trailing_suffix = true;
             }
