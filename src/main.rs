@@ -15,12 +15,11 @@
 // - Elements with data-noreformat: copy their entire subtree verbatim.
 // - RAW-TEXT tags (verbatim): pre, textarea, script, style, xmp, wpt.
 // - Bikeshed/Markdown-aware reflow in text nodes (bullets, ordered lists, dt/dd, quotes,
-//   hr, ATX/Setext headings, fenced code blocks). List items reflow wrapped lines.
+//   hr, ATX/Setext headings, fenced code blocks). List items and dt/dd items reflow wrapped lines.
 // - INLINE start tags at start-of-line soft-join into previous text unless exceptions apply.
 // - <br> preserves an immediately following '\n'.
 // - 'foreignobject' included in STRUCTURAL_START.
-// - UTF-8 safe: input is UTF-8; text reflow routines operate on &str slices and never
-//   push raw bytes as chars.
+// - UTF-8 safe.
 //
 // CLI flags:
 //   --markdown      : force-enable Markdown/Bikeshed reflow
@@ -239,7 +238,6 @@ fn parse_tag_info<'a>(tag: &'a [u8]) -> TagInfo<'a> {
 
 fn tag_has_noreformat_attr(tag: &[u8]) -> bool {
     // Robust attribute scanner: [name] ( '=' [value] )?
-    // value may be quoted or unquoted; we only care if any attribute name equals "data-noreformat".
     let len = tag.len();
     if len < 2 {
         return false;
@@ -547,7 +545,7 @@ fn starts_with_ol(line: &str) -> Option<(String, String)> {
     if pos >= bytes.len() || !(bytes[pos] == b' ' || bytes[pos] == b'\t') { return None; }
     while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') { pos += 1; }
 
-    let digits = &line[i..dot_pos]; // digits only
+    let digits = &line[i..dot_pos];
     let prefix = format!("{indent}{digits}. ");
     let first = line[pos..].to_string();
     Some((prefix, first))
@@ -579,32 +577,44 @@ fn is_blockquote(line: &str) -> bool {
     false
 }
 
-fn is_dt(line: &str) -> bool {
-    // ^\s*:\s+
+fn parse_dt(line: &str) -> Option<(String, String)> {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-    if i < bytes.len() && bytes[i] == b':' {
-        let j = i + 1;
-        if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            return true;
+    if i >= bytes.len() || bytes[i] != b':' { return None; }
+    let mut j = i + 1;
+    let has_extra_space = j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t');
+    if has_extra_space || j == bytes.len() {
+        if has_extra_space {
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') { j += 1; }
         }
+        let space = if j == bytes.len() { "" } else { " " };
+        let prefix = format!("{}:{space}", &line[..i]);
+        let first = line[j..].to_string();
+        Some((prefix, first))
+    } else {
+        None
     }
-    false
 }
 
-fn is_dd(line: &str) -> bool {
-    // ^\s*::\s+
+fn parse_dd(line: &str) -> Option<(String, String)> {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-    if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
-        let j = i + 2;
-        if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            return true;
+    if i + 1 >= bytes.len() || bytes[i] != b':' || bytes[i + 1] != b':' { return None; }
+    let mut j = i + 2;
+    let has_extra_space = j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t');
+    if has_extra_space || j == bytes.len() {
+        if has_extra_space {
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') { j += 1; }
         }
+        let space = if j == bytes.len() { "" } else { " " };
+        let prefix = format!("{}::{space}", &line[..i]);
+        let first = line[j..].to_string();
+        Some((prefix, first))
+    } else {
+        None
     }
-    false
 }
 
 fn fence_open(line: &str) -> Option<Fence> {
@@ -634,6 +644,54 @@ fn fence_close(line: &str, f: Fence) -> bool {
     if count < f.min { return false; }
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
     i == bytes.len()
+}
+
+/* ---------- Helpers to keep DT/DD on their own lines during reflow ---------- */
+
+#[inline]
+fn body_begins_with_dt_or_dd_after_single_lf(body: &[u8]) -> bool {
+    // Matches: "\n" + ws* + ":" [ ":" ] (space/tab or end)
+    if body.is_empty() || body[0] != b'\n' { return false; }
+    let mut j = 1usize;
+    while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
+    if j >= body.len() || body[j] != b':' { return false; }
+    j += 1;
+    if j < body.len() && body[j] == b':' { j += 1; }
+    if j >= body.len() { return true; }
+    body[j] == b' ' || body[j] == b'\t'
+}
+
+/// Return true if the **line containing `pos`** begins (after optional spaces/tabs)
+/// with `: ` or `:: ` — i.e., a DT/DD marker. This handles the case where `pos`
+/// points into the *same line* (e.g., at a `<` that follows the marker).
+fn line_at_pos_starts_with_dt_or_dd(src: &[u8], pos: usize) -> bool {
+    let n = src.len();
+    if pos > n { return false; }
+    let line_start = memrchr(b'\n', &src[..pos]).map(|x| x + 1).unwrap_or(0);
+    let mut i = line_start;
+    while i < n && (src[i] == b' ' || src[i] == b'\t') { i += 1; }
+    if i >= n { return false; }
+    if src[i] != b':' { return false; }
+    i += 1;
+    if i < n && src[i] == b':' { i += 1; }
+    if i >= n { return true; }
+    src[i] == b' ' || src[i] == b'\t'
+}
+
+/// If body starts with "\n"+indent+":"[":"], return index of the first ':' (end of indent).
+#[inline]
+fn leading_lf_indent_end_before_dt_or_dd(body: &[u8]) -> Option<usize> {
+    if body.is_empty() || body[0] != b'\n' { return None; }
+    let mut j = 1usize;
+    while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
+    if j >= body.len() || body[j] != b':' { return None; }
+    // optional second ':'
+    let mut k = j + 1;
+    if k < body.len() && body[k] == b':' { k += 1; }
+    if k < body.len() && !(body[k] == b' ' || body[k] == b'\t') {
+        return None;
+    }
+    Some(j)
 }
 
 fn reflow_markdown_text(text: &str) -> String {
@@ -697,22 +755,7 @@ fn reflow_markdown_text(text: &str) -> String {
             continue;
         }
 
-        let is_structural_line =
-            is_atx_heading(line_no_nl) ||
-            is_dt(line_no_nl) ||
-            is_dd(line_no_nl) ||
-            is_blockquote(line_no_nl) ||
-            is_hr_line_stripped(line_stripped_ws) ||
-            (is_setext_underline_stripped(line_stripped_ws) && prev_nonblank_was_paragraph);
-
-        if is_structural_line {
-            flush_para(true, &mut out, &mut para_parts);
-            out.push_str(raw);
-            prev_nonblank_was_paragraph = false;
-            continue;
-        }
-
-        // bullets
+        // Handle UL/OL/DT/DD first
         if let Some((prefix, first_text)) = starts_with_bullet(line_no_nl) {
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
@@ -728,12 +771,11 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_atx_heading(nxt)
                     || starts_with_bullet(nxt).is_some()
                     || starts_with_ol(nxt).is_some()
-                    || is_dt(nxt) || is_dd(nxt) || is_blockquote(nxt)
+                    || parse_dt(nxt).is_some() || parse_dd(nxt).is_some()
+                    || is_blockquote(nxt)
                     || is_hr_line_stripped(nxt_stripped)
                     || is_setext_underline_stripped(nxt_stripped)
-                {
-                    break;
-                }
+                { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
                 lines_iter.next();
             }
@@ -750,7 +792,6 @@ fn reflow_markdown_text(text: &str) -> String {
             continue;
         }
 
-        // ordered list
         if let Some((prefix, first_text)) = starts_with_ol(line_no_nl) {
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
@@ -766,12 +807,11 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_atx_heading(nxt)
                     || starts_with_bullet(nxt).is_some()
                     || starts_with_ol(nxt).is_some()
-                    || is_dt(nxt) || is_dd(nxt) || is_blockquote(nxt)
+                    || parse_dt(nxt).is_some() || parse_dd(nxt).is_some()
+                    || is_blockquote(nxt)
                     || is_hr_line_stripped(nxt_stripped)
                     || is_setext_underline_stripped(nxt_stripped)
-                {
-                    break;
-                }
+                { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
                 lines_iter.next();
             }
@@ -784,6 +824,94 @@ fn reflow_markdown_text(text: &str) -> String {
             out.push_str(&prefix);
             out.push_str(&joined);
             if had_nl { out.push('\n'); }
+            prev_nonblank_was_paragraph = false;
+            continue;
+        }
+
+        if let Some((prefix, first_text)) = parse_dt(line_no_nl) {
+            // Definition term
+            flush_para(true, &mut out, &mut para_parts);
+            let mut contents: Vec<String> = vec![first_text];
+
+            while let Some(peek) = lines_iter.peek() {
+                let nxt_raw = *peek;
+                let nxt_had_nl = nxt_raw.ends_with('\n');
+                let nxt = if nxt_had_nl { &nxt_raw[..nxt_raw.len()-1] } else { nxt_raw };
+                let nxt_stripped = nxt.trim();
+
+                if nxt_stripped.is_empty() { break; }
+                if fence_open(nxt).is_some()
+                    || is_atx_heading(nxt)
+                    || starts_with_bullet(nxt).is_some()
+                    || starts_with_ol(nxt).is_some()
+                    || parse_dt(nxt).is_some() || parse_dd(nxt).is_some()
+                    || is_blockquote(nxt)
+                    || is_hr_line_stripped(nxt_stripped)
+                    || is_setext_underline_stripped(nxt_stripped)
+                { break; }
+                contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                lines_iter.next();
+            }
+
+            let mut joined = contents.remove(0).trim_end_matches([' ', '\t']).to_string();
+            for c in contents {
+                joined.push(' ');
+                joined.push_str(c.trim_start_matches([' ', '\t']));
+            }
+            out.push_str(&prefix);
+            out.push_str(&joined);
+            if had_nl { out.push('\n'); }
+            prev_nonblank_was_paragraph = false;
+            continue;
+        }
+
+        if let Some((prefix, first_text)) = parse_dd(line_no_nl) {
+            // Definition description
+            flush_para(true, &mut out, &mut para_parts);
+            let mut contents: Vec<String> = vec![first_text];
+
+            while let Some(peek) = lines_iter.peek() {
+                let nxt_raw = *peek;
+                let nxt_had_nl = nxt_raw.ends_with('\n');
+                let nxt = if nxt_had_nl { &nxt_raw[..nxt_raw.len()-1] } else { nxt_raw };
+                let nxt_stripped = nxt.trim();
+
+                if nxt_stripped.is_empty() { break; }
+                if fence_open(nxt).is_some()
+                    || is_atx_heading(nxt)
+                    || starts_with_bullet(nxt).is_some()
+                    || starts_with_ol(nxt).is_some()
+                    || parse_dt(nxt).is_some() || parse_dd(nxt).is_some()
+                    || is_blockquote(nxt)
+                    || is_hr_line_stripped(nxt_stripped)
+                    || is_setext_underline_stripped(nxt_stripped)
+                { break; }
+                contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                lines_iter.next();
+            }
+
+            let mut joined = contents.remove(0).trim_end_matches([' ', '\t']).to_string();
+            for c in contents {
+                joined.push(' ');
+                joined.push_str(c.trim_start_matches([' ', '\t']));
+            }
+            out.push_str(&prefix);
+            out.push_str(&joined);
+            if had_nl { out.push('\n'); }
+            prev_nonblank_was_paragraph = false;
+            continue;
+        }
+
+        // Generic structural lines
+        let is_structural_line =
+            is_atx_heading(line_no_nl) ||
+            is_blockquote(line_no_nl) ||
+            is_hr_line_stripped(line_stripped_ws) ||
+            (is_setext_underline_stripped(line_stripped_ws) && prev_nonblank_was_paragraph);
+
+        if is_structural_line {
+            flush_para(true, &mut out, &mut para_parts);
+            out.push_str(raw);
             prev_nonblank_was_paragraph = false;
             continue;
         }
@@ -821,7 +949,7 @@ fn reflow_plain_text(text: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'\n' {
             if seg_start < i {
-                out.push_str(&text[seg_start..i]); // safe: ASCII boundary
+                out.push_str(&text[seg_start..i]); // safe: char boundary
             }
             if !out.ends_with(' ') {
                 out.push(' ');
@@ -892,7 +1020,7 @@ fn trailing_lf_count_ignoring_spaces(chunk: &[u8]) -> usize {
 /// Returns (new_index_after_end_tag, closed_found).
 fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
     let n = src.len();
-    let lower_name = name.to_ascii_lowercase(); // small
+    let lower_name = name.to_ascii_lowercase();
     let name_ref = lower_name.as_slice();
 
     let mut j = i;
@@ -904,7 +1032,7 @@ fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>)
             out.extend_from_slice(&src[j..]);
             return (n, false);
         };
-        // emit text between j and pos
+        // emit text between j and pos verbatim
         out.extend_from_slice(&src[j..pos]);
 
         // Not enough room for "</"
@@ -919,17 +1047,14 @@ fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>)
         if let Some(end) = find_tag_end(src, pos) {
             let ti = parse_tag_info(&src[pos..=end]);
             if ti.name.eq_ignore_ascii_case(name_ref) {
-                // Found the matching end tag
                 normalize_inside_tag(&src[pos..=end], out);
                 return (end + 1, true);
             } else {
-                // Some other end tag; treat literally
                 out.extend_from_slice(&src[pos..=end]);
                 j = end + 1;
                 continue;
             }
         } else {
-            // Unterminated tag to EOF; treat literally
             out.extend_from_slice(&src[pos..]);
             return (n, false);
         }
@@ -1011,6 +1136,13 @@ fn reflow_text_chunk(
             }
         }
     }
+
+    // If the line that contains `next_lt` (often a DT/DD line) begins with : or ::, keep suffix.
+    let boundary_end = at_index_i + chunk.len();
+    if use_markdown && line_at_pos_starts_with_dt_or_dd(src, boundary_end) {
+        preserve_trailing_suffix = true;
+    }
+
     let preserve_leading_prefix = after_standalone_comment || after_br;
 
     if preserve_leading_prefix || preserve_trailing_suffix {
@@ -1020,7 +1152,7 @@ fn reflow_text_chunk(
             while left < chunk.len() && is_ws(chunk[left]) { left += 1; }
             out.extend_from_slice(&chunk[..left]);
         }
-        // suffix: ALL trailing whitespace (preserve exactly before structural/comment)
+        // suffix: ALL trailing whitespace (preserve exactly before structural/comment/DT/DD)
         let mut idx = chunk.len();
         while idx > left && is_ws(chunk[idx - 1]) {
             idx -= 1;
@@ -1029,29 +1161,58 @@ fn reflow_text_chunk(
         let body = &chunk[left..suffix_start];
 
         if !body.is_empty() {
-            // Soft wrap at start-of-body
-            if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
-                && !prev_line_ends_with_structural_start(src, at_index_i)
-                && !after_br && !after_standalone_comment
-            {
-                // replace that single leading LF + indentation with a space
-                let mut j = 1usize;
-                while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
-                let rest = std::str::from_utf8(&body[j..]).unwrap();
-                let mut body_str = String::with_capacity(1 + rest.len());
-                body_str.push(' ');
-                body_str.push_str(rest);
-                let reflowed = reflow_text(&body_str, use_markdown);
-                out.extend_from_slice(reflowed.as_bytes());
+            // SPECIAL: Keep DT/DD on their own line when body starts with "\n" + indent + ":"[":"]
+            if use_markdown {
+                if let Some(indent_end) = leading_lf_indent_end_before_dt_or_dd(body) {
+                    // Emit "\n" + indentation
+                    out.push(b'\n');
+                    out.extend_from_slice(&body[1..indent_end]); // indentation
+                    let rest = std::str::from_utf8(&body[indent_end..]).unwrap();
+                    let reflowed = reflow_text(rest, use_markdown);
+                    out.extend_from_slice(reflowed.as_bytes());
+                } else if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
+                    && !prev_line_ends_with_structural_start(src, at_index_i)
+                    && !after_br && !after_standalone_comment
+                    && !body_begins_with_dt_or_dd_after_single_lf(body)
+                {
+                    // Soft wrap single LF → space
+                    let mut j = 1usize;
+                    while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
+                    let rest = std::str::from_utf8(&body[j..]).unwrap();
+                    let mut body_str = String::with_capacity(1 + rest.len());
+                    body_str.push(' ');
+                    body_str.push_str(rest);
+                    let reflowed = reflow_text(&body_str, use_markdown);
+                    out.extend_from_slice(reflowed.as_bytes());
+                } else {
+                    let body_str = std::str::from_utf8(body).unwrap();
+                    let reflowed = reflow_text(body_str, use_markdown);
+                    out.extend_from_slice(reflowed.as_bytes());
+                }
             } else {
-                let body_str = std::str::from_utf8(body).unwrap();
-                let reflowed = reflow_text(body_str, use_markdown);
-                out.extend_from_slice(reflowed.as_bytes());
+                // Plain text mode
+                if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
+                    && !prev_line_ends_with_structural_start(src, at_index_i)
+                    && !after_br && !after_standalone_comment
+                {
+                    let mut j = 1usize;
+                    while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
+                    let rest = std::str::from_utf8(&body[j..]).unwrap();
+                    let mut body_str = String::with_capacity(1 + rest.len());
+                    body_str.push(' ');
+                    body_str.push_str(rest);
+                    let reflowed = reflow_text(&body_str, use_markdown);
+                    out.extend_from_slice(reflowed.as_bytes());
+                } else {
+                    let body_str = std::str::from_utf8(body).unwrap();
+                    let reflowed = reflow_text(body_str, use_markdown);
+                    out.extend_from_slice(reflowed.as_bytes());
+                }
             }
         }
 
         if preserve_trailing_suffix {
-            out.extend_from_slice(&chunk[suffix_start..]); // <-- preserve spaces before structural/comment
+            out.extend_from_slice(&chunk[suffix_start..]); // preserve spaces/newlines before DT/DD/comment/structural
         }
         return;
     }
@@ -1065,11 +1226,26 @@ fn reflow_text_chunk(
     }
     let body = &chunk[lead_len..chunk.len() - trail_len];
 
-    // Soft-wrap at start-of-body
+    // SPECIAL: DT/DD must start on a new line — emit the newline + indentation, then reflow the rest.
+    if use_markdown {
+        if let Some(indent_end) = leading_lf_indent_end_before_dt_or_dd(body) {
+            out.extend_from_slice(&chunk[..lead_len]); // leading spaces (no newlines here)
+            out.push(b'\n');
+            out.extend_from_slice(&body[1..indent_end]); // indentation
+            let rest = std::str::from_utf8(&body[indent_end..]).unwrap();
+            let reflowed = reflow_text(rest, use_markdown);
+            out.extend_from_slice(reflowed.as_bytes());
+            out.extend_from_slice(&chunk[chunk.len() - trail_len..]);
+            return;
+        }
+    }
+
+    // Soft-wrap at start-of-body — but NOT if that newline introduces a DT/DD line.
     let mut tmp = String::new();
     let body_str = if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
         && !prev_line_ends_with_structural_start(src, at_index_i)
         && !after_br && !after_standalone_comment
+        && !(use_markdown && body_begins_with_dt_or_dd_after_single_lf(body))
     {
         let mut j = 1usize;
         while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }

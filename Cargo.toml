@@ -1,6 +1,6 @@
 [package]
 name = "reformahtml"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Command line tool to format HTML or Bikeshed-flavored markdown to no-line-breaks but keep original indentation."
