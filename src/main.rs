@@ -1,17 +1,17 @@
 // src/main.rs
 //
-// reformahtml -- fast HTML/Bikeshed reflower
+// reformahtml — fast HTML/Bikeshed reflower
 //
 // - Collapses intra-paragraph line breaks while preserving indentation/blank lines
 //   around structural HTML tags and standalone comments.
 // - Inside tags:
-//     - Outside quotes: collapse any whitespace runs -> single space, EXCEPT when a newline-run
-//       is immediately before/after '=' -> insert nothing.
-//     - Inside quotes: collapse only runs that include a newline -> single space.
+//     • Outside quotes: collapse any whitespace runs → single space, EXCEPT when a newline-run
+//       is immediately before/after '=' → insert nothing.
+//     • Inside quotes: collapse only runs that include a newline → single space.
 // - HTML comments:
-//     - Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
+//     • Standalone (only whitespace before on its line, and next char after '-->' is '\n'):
 //         keep verbatim and treat as a structural boundary on BOTH sides.
-//     - Otherwise: reflow the comment inline (collapse newline-including runs inside it).
+//     • Otherwise: reflow the comment inline (collapse newline-including runs inside it).
 // - Elements with data-noreformat: copy their entire subtree verbatim.
 // - RAW-TEXT tags (verbatim): pre, textarea, script, style, xmp, wpt.
 // - Bikeshed/Markdown-aware reflow in text nodes (bullets, ordered lists, dt/dd, quotes,
@@ -854,7 +854,7 @@ fn reflow_markdown_text(text: &str) -> String {
             continue;
         }
 
-        if let Some((prefix, first_text)) = parse_dd(line_no_nl) {
+        if let Some((prefix, first_text) ) = parse_dd(line_no_nl) {
             // Definition description
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
@@ -1059,20 +1059,20 @@ fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>)
 
 /* ========================== Text chunk handling ========================= */
 
-fn classify_ahead(src: &[u8], next_lt: usize) -> (bool /*standalone comment*/, Option<TagInfo<'_>>) {
-    if next_lt >= src.len() { return (false, None); }
+fn classify_ahead(src: &[u8], next_lt: usize) -> (bool, bool, Option<TagInfo<'_>>) {
+    if next_lt >= src.len() { return (false, false, None); }
     if src[next_lt..].starts_with(b"<!--") {
         let (j_end, standalone) = scan_comment(src, next_lt);
-        if j_end == usize::MAX { return (false, None); }
-        return (standalone, None);
+        if j_end == usize::MAX { return (false, false, None); }
+        return (standalone, !standalone, None);
     }
     if src[next_lt] == b'<' {
         if let Some(j) = find_tag_end(src, next_lt) {
             let ti = parse_tag_info(&src[next_lt..=j]);
-            return (false, Some(ti));
+            return (false, false, Some(ti));
         }
     }
-    (false, None)
+    (false, false, None)
 }
 
 fn reflow_text_chunk(
@@ -1085,7 +1085,7 @@ fn reflow_text_chunk(
     after_br: bool,
     at_index_i: usize,
 ) {
-    let (ahead_is_standalone_comment, ahead_tag) = classify_ahead(src, next_lt);
+    let (ahead_is_standalone_comment, is_inline_comment, ahead_tag) = classify_ahead(src, next_lt);
 
     let chunk_is_ws_only = chunk.iter().all(|&b| is_ws(b));
     if chunk_is_ws_only {
@@ -1268,6 +1268,29 @@ fn reflow_text_chunk(
             out.extend_from_slice(&chunk[..lead_len]); // leading spaces
             out.extend_from_slice(reflowed.as_bytes());
             out.push(b' ');
+            return;
+        }
+    } else if is_inline_comment {
+        if trailing_lfs == 1 && !prev_line_ends_with_structural_start(src, at_index_i + chunk.len()) {
+            while reflowed.ends_with(' ') || reflowed.ends_with('\t') { reflowed.pop(); }
+            if reflowed.ends_with('\n') {
+                reflowed.pop();
+                while reflowed.ends_with(' ') || reflowed.ends_with('\t') { reflowed.pop(); }
+            }
+            out.extend_from_slice(&chunk[..lead_len]);
+            out.extend_from_slice(reflowed.as_bytes());
+            out.push(b' ');
+            return;
+        }
+    } else if ahead_tag.is_none() && !ahead_is_standalone_comment {
+        if trailing_lfs == 1 && !prev_line_ends_with_structural_start(src, at_index_i + chunk.len()) {
+            while reflowed.ends_with(' ') || reflowed.ends_with('\t') { reflowed.pop(); }
+            if reflowed.ends_with('\n') {
+                reflowed.pop();
+                while reflowed.ends_with(' ') || reflowed.ends_with('\t') { reflowed.pop(); }
+            }
+            out.extend_from_slice(&chunk[..lead_len]);
+            out.extend_from_slice(reflowed.as_bytes());
             return;
         }
     }
