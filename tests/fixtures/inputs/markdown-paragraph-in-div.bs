@@ -1,0 +1,6 @@
+<div algorithm>
+ The <dfn id="rs-pipe-through" method for="ReadableStream">pipeThrough(|transform|, |options|)</dfn>
+ method steps are:
+ 
+ 1. ...
+</div>

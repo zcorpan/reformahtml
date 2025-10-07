@@ -748,6 +748,7 @@ fn reflow_markdown_text(text: &str) -> String {
         if let Some((prefix, first_text)) = starts_with_bullet(line_no_nl) {
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
+            let mut last_had_nl = had_nl;
 
             while let Some(peek) = lines_iter.peek() {
                 let nxt_raw = *peek;
@@ -766,6 +767,7 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_setext_underline_stripped(nxt_stripped)
                 { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                last_had_nl = nxt_had_nl;
                 lines_iter.next();
             }
 
@@ -776,7 +778,7 @@ fn reflow_markdown_text(text: &str) -> String {
             }
             out.push_str(&prefix);
             out.push_str(&joined);
-            if had_nl { out.push('\n'); }
+            if last_had_nl { out.push('\n'); }
             prev_nonblank_was_paragraph = false;
             continue;
         }
@@ -784,6 +786,7 @@ fn reflow_markdown_text(text: &str) -> String {
         if let Some((prefix, first_text)) = starts_with_ol(line_no_nl) {
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
+            let mut last_had_nl = had_nl;
 
             while let Some(peek) = lines_iter.peek() {
                 let nxt_raw = *peek;
@@ -802,6 +805,7 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_setext_underline_stripped(nxt_stripped)
                 { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                last_had_nl = nxt_had_nl;
                 lines_iter.next();
             }
 
@@ -812,7 +816,7 @@ fn reflow_markdown_text(text: &str) -> String {
             }
             out.push_str(&prefix);
             out.push_str(&joined);
-            if had_nl { out.push('\n'); }
+            if last_had_nl { out.push('\n'); }
             prev_nonblank_was_paragraph = false;
             continue;
         }
@@ -821,6 +825,7 @@ fn reflow_markdown_text(text: &str) -> String {
             // Definition term
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
+            let mut last_had_nl = had_nl;
 
             while let Some(peek) = lines_iter.peek() {
                 let nxt_raw = *peek;
@@ -839,6 +844,7 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_setext_underline_stripped(nxt_stripped)
                 { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                last_had_nl = nxt_had_nl;
                 lines_iter.next();
             }
 
@@ -849,15 +855,16 @@ fn reflow_markdown_text(text: &str) -> String {
             }
             out.push_str(&prefix);
             out.push_str(&joined);
-            if had_nl { out.push('\n'); }
+            if last_had_nl { out.push('\n'); }
             prev_nonblank_was_paragraph = false;
             continue;
         }
 
-        if let Some((prefix, first_text) ) = parse_dd(line_no_nl) {
+        if let Some((prefix, first_text)) = parse_dd(line_no_nl) {
             // Definition description
             flush_para(true, &mut out, &mut para_parts);
             let mut contents: Vec<String> = vec![first_text];
+            let mut last_had_nl = had_nl;
 
             while let Some(peek) = lines_iter.peek() {
                 let nxt_raw = *peek;
@@ -876,6 +883,7 @@ fn reflow_markdown_text(text: &str) -> String {
                     || is_setext_underline_stripped(nxt_stripped)
                 { break; }
                 contents.push(nxt.trim_start_matches([' ', '\t']).to_string());
+                last_had_nl = nxt_had_nl;
                 lines_iter.next();
             }
 
@@ -886,7 +894,7 @@ fn reflow_markdown_text(text: &str) -> String {
             }
             out.push_str(&prefix);
             out.push_str(&joined);
-            if had_nl { out.push('\n'); }
+            if last_had_nl { out.push('\n'); }
             prev_nonblank_was_paragraph = false;
             continue;
         }
@@ -972,6 +980,7 @@ fn prev_line_ends_with_structural_start(s: &[u8], mut boundary: usize) -> bool {
     loop {
         let line_start = memrchr(b'\n', &s[..boundary]).map(|x| x + 1).unwrap_or(0);
         if line_start >= boundary { return false; }
+        // Trim trailing spaces/tabs
         let mut end = boundary;
         while end > line_start && is_space_tab(s[end - 1]) { end -= 1; }
         if end > line_start {
@@ -1085,7 +1094,7 @@ fn reflow_text_chunk(
     after_br: bool,
     at_index_i: usize,
 ) {
-    let (ahead_is_standalone_comment, is_inline_comment, ahead_tag) = classify_ahead(src, next_lt);
+    let (ahead_is_standalone_comment, ahead_is_inline_comment, ahead_tag) = classify_ahead(src, next_lt);
 
     let chunk_is_ws_only = chunk.iter().all(|&b| is_ws(b));
     if chunk_is_ws_only {
@@ -1124,8 +1133,7 @@ fn reflow_text_chunk(
         if ahead_is_standalone_comment {
             preserve_trailing_suffix = true;
         } else if let Some(ti) = ahead_tag {
-            if is_structural(ti.name)
-            {
+            if is_structural(ti.name) {
                 preserve_trailing_suffix = true;
             }
         }
@@ -1270,7 +1278,7 @@ fn reflow_text_chunk(
             out.push(b' ');
             return;
         }
-    } else if is_inline_comment {
+    } else if ahead_is_inline_comment {
         if trailing_lfs == 1 && !prev_line_ends_with_structural_start(src, at_index_i + chunk.len()) {
             while reflowed.ends_with(' ') || reflowed.ends_with('\t') { reflowed.pop(); }
             if reflowed.ends_with('\n') {
@@ -1424,5 +1432,54 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
         after_standalone_comment = false;
         after_br = false;
         i = next_lt;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, DirEntry};
+    use std::path::Path;
+
+    #[test]
+    fn regression_tests() {
+        let inputs_dir = Path::new("tests/fixtures/inputs");
+        let expected_dir = Path::new("tests/fixtures/expected");
+        let update_expected = std::env::var("UPDATE_EXPECTED").is_ok();
+
+        if !inputs_dir.exists() {
+            return; // No fixtures yet, skip
+        }
+
+        let entries: Vec<DirEntry> = fs::read_dir(inputs_dir).unwrap().map(|e| e.unwrap()).collect();
+
+        for entry in entries {
+            let input_path = entry.path();
+            let ext = input_path.extension().unwrap_or_default().to_str().unwrap_or("");
+            if ext != "bs" && ext != "html" {
+                continue;
+            }
+
+            let stem = input_path.file_stem().unwrap().to_str().unwrap();
+            let expected_path = expected_dir.join(format!("{}.{}", stem, ext));
+
+            let src = fs::read(&input_path).unwrap();
+            let mut out = Vec::new();
+
+            // Enable markdown for .bs, disable for .html
+            let use_markdown = ext == "bs";
+
+            transform(&src, &mut out, use_markdown);
+
+            let actual = String::from_utf8(out).unwrap();
+
+            if update_expected {
+                fs::create_dir_all(expected_dir).unwrap();
+                fs::write(&expected_path, actual.as_bytes()).unwrap();
+            } else {
+                let expected = fs::read_to_string(&expected_path).unwrap_or_else(|_| panic!("Expected file not found: {:?}", expected_path));
+                assert_eq!(actual, expected, "Mismatch for test: {}", stem);
+            }
+        }
     }
 }

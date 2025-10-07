@@ -1,0 +1,26 @@
+: <dfn export for="read request">chunk steps</dfn>
+:: An algorithm taking a [=chunk=], called when a chunk is available for reading
+: <dfn export for="read request">close steps</dfn>
+:: An algorithm taking no arguments, called when no [=chunks=] are available because the stream is
+   closed
+: <dfn export for="read request">error steps</dfn>
+:: An algorithm taking a JavaScript value, called when no [=chunks=] are available because the
+   stream is errored
+
+ 1. Let |reader| be |iterator|'s [=ReadableStream async iterator/reader=].
+ 1. Assert: |reader|.[=ReadableStreamGenericReader/[[stream]]=] is not undefined.
+ 1. Let |promise| be [=a new promise=].
+ 1. Let |readRequest| be a new [=read request=] with the following [=struct/items=]:
+  : [=read request/chunk steps=], given |chunk|
+  ::
+   1. [=Resolve=] |promise| with |chunk|.
+  : [=read request/close steps=]
+  ::
+   1. Perform ! [$ReadableStreamDefaultReaderRelease$](|reader|).
+   1. [=Resolve=] |promise| with [=end of iteration=].
+  : [=read request/error steps=], given |e|
+  ::
+   1. Perform ! [$ReadableStreamDefaultReaderRelease$](|reader|).
+   1. [=Reject=] |promise| with |e|.
+ 1. Perform ! [$ReadableStreamDefaultReaderRead$]([=this=], |readRequest|).
+ 1. Return |promise|.

@@ -1,0 +1,14 @@
+* Video effects: piping a readable video stream through a transform stream that applies effects in
+  real time.
+* Decompression: piping a file stream through a transform stream that selectively decompresses files
+  from a <kbd>.tgz</kbd> archive, turning them into <{img}> elements as the user scrolls through an image gallery.
+* Image decoding: piping an HTTP response stream through a transform stream that decodes bytes into
+  bitmap data, and then through another transform that translates bitmaps into PNGs. If installed inside the {{ServiceWorkerGlobalScope/fetch}} hook of a service worker, this would allow developers to transparently polyfill new image formats. [[SERVICE-WORKERS]]
+
+* A GZIP compressor, to which uncompressed bytes are written and from which compressed bytes are
+  read;
+* A video decoder, to which encoded bytes are written and from which uncompressed video frames are
+  read;
+* A text decoder, to which bytes are written and from which strings are read;
+* A CSV-to-JSON converter, to which strings representing lines of a CSV file are written and from
+  which corresponding JavaScript objects are read.

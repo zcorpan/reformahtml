@@ -1,0 +1,23 @@
+<xmp highlight="js">
+ const reader = readableStream.getReader({ mode: "byob" });
+
+ let startingAB = new ArrayBuffer(1024);
+ const buffer = await readInto(startingAB);
+ console.log("The first 1024 bytes: ", buffer);
+
+ async function readInto(buffer) {
+   let offset = 0;
+
+   while (offset < buffer.byteLength) {
+     const { value: view, done } =
+      await reader.read(new Uint8Array(buffer, offset, buffer.byteLength - offset));
+     buffer = view.buffer;
+     if (done) {
+       break;
+     }
+     offset += view.byteLength;
+   }
+
+   return buffer;
+ }
+ </xmp>
