@@ -1215,6 +1215,8 @@ fn reflow_text_chunk(
 
         if preserve_trailing_suffix {
             out.extend_from_slice(&chunk[suffix_start..]); // preserve spaces/newlines before DT/DD/comment/structural
+        } else if (ahead_tag.map_or(false, |ti| !ti.is_end && is_inline(ti.name)) || ahead_is_inline_comment) && suffix_start < chunk.len() {
+            out.push(b' ');
         }
         return;
     }
