@@ -1090,7 +1090,7 @@ fn reflow_text_chunk(
     next_lt: usize,
     out: &mut Vec<u8>,
     use_markdown: bool,
-    after_standalone_comment: bool,
+    after_boundary: bool,
     after_br: bool,
     at_index_i: usize,
 ) {
@@ -1145,7 +1145,7 @@ fn reflow_text_chunk(
         preserve_trailing_suffix = true;
     }
 
-    let preserve_leading_prefix = after_standalone_comment || after_br;
+    let preserve_leading_prefix = after_boundary || after_br;
 
     if preserve_leading_prefix || preserve_trailing_suffix {
         // prefix: leading whitespace
@@ -1174,8 +1174,8 @@ fn reflow_text_chunk(
                     out.extend_from_slice(reflowed.as_bytes());
                 } else if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
                     && !prev_line_ends_with_structural_start(src, at_index_i)
-                    && !after_br && !after_standalone_comment
-                    && !body_begins_with_dt_or_dd_after_single_lf(body)
+                    && !after_br && !after_boundary
+                    && !(use_markdown && body_begins_with_dt_or_dd_after_single_lf(body))
                 {
                     // Soft wrap single LF → space
                     let mut j = 1usize;
@@ -1195,7 +1195,7 @@ fn reflow_text_chunk(
                 // Plain text mode
                 if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
                     && !prev_line_ends_with_structural_start(src, at_index_i)
-                    && !after_br && !after_standalone_comment
+                    && !after_br && !after_boundary
                 {
                     let mut j = 1usize;
                     while j < body.len() && (body[j] == b' ' || body[j] == b'\t') { j += 1; }
@@ -1248,7 +1248,7 @@ fn reflow_text_chunk(
     let mut tmp = String::new();
     let body_str = if body.starts_with(b"\n") && (body.len() == 1 || body[1] != b'\n')
         && !prev_line_ends_with_structural_start(src, at_index_i)
-        && !after_br && !after_standalone_comment
+        && !after_br && !after_boundary
         && !(use_markdown && body_begins_with_dt_or_dd_after_single_lf(body))
     {
         let mut j = 1usize;
@@ -1319,7 +1319,7 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
     // Stacks/state
     let mut raw_stack: Vec<Vec<u8>> = Vec::new();        // names of raw-text tags in lowercase
     let mut noreformat_stack: Vec<Vec<u8>> = Vec::new(); // element names with data-noreformat
-    let mut after_standalone_comment = false;
+    let mut after_boundary = false;
     let mut after_br = false;
 
     while i < n {
@@ -1327,7 +1327,7 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
         if let Some(current_raw) = raw_stack.last().cloned() {
             let (new_i, closed) = copy_raw_text_until_end(src, i, &current_raw, out);
             i = new_i;
-            after_standalone_comment = false;
+            after_boundary = false;
             after_br = false;
             if closed {
                 raw_stack.pop();
@@ -1349,10 +1349,10 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
                 out.extend_from_slice(seg);
             } else if standalone {
                 out.extend_from_slice(seg);
-                after_standalone_comment = true;
+                after_boundary = true;
             } else {
                 reflow_inline_comment(seg, out);
-                after_standalone_comment = false;
+                after_boundary = false;
             }
             i = j_end + 3;
             continue;
@@ -1405,7 +1405,12 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
                 }
             }
 
-            after_standalone_comment = false;
+            // Set after_boundary for structural start tags
+            if !ti.is_end && is_structural(ti.name) && !ti.self_closing {
+                after_boundary = true;
+            } else {
+                after_boundary = false;
+            }
             i = j + 1;
             continue;
         }
@@ -1426,12 +1431,12 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
             next_lt,
             out,
             use_markdown,
-            after_standalone_comment,
+            after_boundary,
             after_br,
             i,
         );
 
-        after_standalone_comment = false;
+        after_boundary = false;
         after_br = false;
         i = next_lt;
     }
