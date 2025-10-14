@@ -1098,6 +1098,14 @@ fn reflow_text_chunk(
 
     let chunk_is_ws_only = chunk.iter().all(|&b| is_ws(b));
     if chunk_is_ws_only {
+        // If we just emitted a structural boundary (including a standalone comment)
+        // or a <br>, preserve the whitespace verbatim. Standalone comments are
+        // structural on BOTH sides, so the immediately following newline must stay.
+        if after_boundary || after_br {
+            out.extend_from_slice(chunk);
+            return;
+        }
+
         if next_lt < src.len() {
             if ahead_is_standalone_comment {
                 out.extend_from_slice(chunk);
