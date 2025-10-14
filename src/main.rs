@@ -1023,7 +1023,7 @@ fn trailing_lf_count_ignoring_spaces(chunk: &[u8]) -> usize {
 
 /// Copy bytes from `i` until the **matching** end tag `</name>` is found.
 /// Returns (new_index_after_end_tag, closed_found).
-fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>, verbatim_end: bool) -> (usize, bool) {
+fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
     let n = src.len();
     let lower_name = name.to_ascii_lowercase();
     let name_ref = lower_name.as_slice();
@@ -1052,11 +1052,7 @@ fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>,
         if let Some(end) = find_tag_end(src, pos) {
             let ti = parse_tag_info(&src[pos..=end]);
             if ti.name.eq_ignore_ascii_case(name_ref) {
-                if verbatim_end {
-                    out.extend_from_slice(&src[pos..=end]);
-                } else {
-                    normalize_inside_tag(&src[pos..=end], out);
-                }
+                normalize_inside_tag(&src[pos..=end], out);
                 return (end + 1, true);
             } else {
                 out.extend_from_slice(&src[pos..=end]);
@@ -1105,6 +1101,16 @@ fn reflow_text_chunk(
         if next_lt < src.len() {
             if ahead_is_standalone_comment {
                 out.extend_from_slice(chunk);
+            } else if ahead_is_inline_comment {
+                if has_single_lf(chunk) {
+                    if prev_line_ends_with_structural_start(src, next_lt) {
+                        out.extend_from_slice(chunk);
+                    } else {
+                        out.push(b' ');
+                    }
+                } else {
+                    out.extend_from_slice(chunk);
+                }
             } else if let Some(ti) = ahead_tag {
                 let structural_ahead = is_structural(ti.name);
                 if structural_ahead {
@@ -1341,8 +1347,7 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
     while i < n {
         // If inside a RAW-TEXT element, copy verbatim until its matching end tag.
         if let Some(current_raw) = raw_stack.last() {
-            let is_verbatim = open_stack.iter().any(|e| e.has_noreformat);
-            let (new_i, closed) = copy_raw_text_until_end(src, i, current_raw, out, is_verbatim);
+            let (new_i, closed) = copy_raw_text_until_end(src, i, current_raw, out);
             i = new_i;
             after_boundary = false;
             after_br = false;
