@@ -1023,7 +1023,7 @@ fn trailing_lf_count_ignoring_spaces(chunk: &[u8]) -> usize {
 
 /// Copy bytes from `i` until the **matching** end tag `</name>` is found.
 /// Returns (new_index_after_end_tag, closed_found).
-fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
+fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>, verbatim_end: bool) -> (usize, bool) {
     let n = src.len();
     let lower_name = name.to_ascii_lowercase();
     let name_ref = lower_name.as_slice();
@@ -1052,7 +1052,11 @@ fn copy_raw_text_until_end(src: &[u8], i: usize, name: &[u8], out: &mut Vec<u8>)
         if let Some(end) = find_tag_end(src, pos) {
             let ti = parse_tag_info(&src[pos..=end]);
             if ti.name.eq_ignore_ascii_case(name_ref) {
-                normalize_inside_tag(&src[pos..=end], out);
+                if verbatim_end {
+                    out.extend_from_slice(&src[pos..=end]);
+                } else {
+                    normalize_inside_tag(&src[pos..=end], out);
+                }
                 return (end + 1, true);
             } else {
                 out.extend_from_slice(&src[pos..=end]);
@@ -1312,27 +1316,39 @@ fn reflow_text_chunk(
 
 /* ============================== Transform =============================== */
 
+#[derive(Clone)]
+struct OpenElement {
+    name: Vec<u8>,
+    has_noreformat: bool,
+}
+
 fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
     let mut i = 0usize;
     let n = src.len();
 
     // Stacks/state
     let mut raw_stack: Vec<Vec<u8>> = Vec::new();        // names of raw-text tags in lowercase
-    let mut noreformat_stack: Vec<Vec<u8>> = Vec::new(); // element names with data-noreformat
+    let mut open_stack: Vec<OpenElement> = Vec::new();
     let mut after_boundary = false;
     let mut after_br = false;
 
+    let p_closing: &[&[u8]] = &[
+        b"address", b"article", b"aside", b"blockquote", b"center", b"details", b"dialog", b"dir",
+        b"div", b"dl", b"fieldset", b"figcaption", b"figure", b"footer", b"header", b"hgroup",
+        b"main", b"menu", b"nav", b"ol", b"p", b"search", b"section", b"summary", b"ul",
+    ];
+
     while i < n {
         // If inside a RAW-TEXT element, copy verbatim until its matching end tag.
-        if let Some(current_raw) = raw_stack.last().cloned() {
-            let (new_i, closed) = copy_raw_text_until_end(src, i, &current_raw, out);
+        if let Some(current_raw) = raw_stack.last() {
+            let is_verbatim = open_stack.iter().any(|e| e.has_noreformat);
+            let (new_i, closed) = copy_raw_text_until_end(src, i, current_raw, out, is_verbatim);
             i = new_i;
             after_boundary = false;
             after_br = false;
             if closed {
                 raw_stack.pop();
-            } else {
-                return;
+                open_stack.pop();
             }
             continue;
         }
@@ -1345,7 +1361,8 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
                 return;
             }
             let seg = &src[i..=j_end + 2]; // includes "-->"
-            if !noreformat_stack.is_empty() {
+            let is_verbatim = open_stack.iter().any(|e| e.has_noreformat);
+            if is_verbatim {
                 out.extend_from_slice(seg);
             } else if standalone {
                 out.extend_from_slice(seg);
@@ -1367,30 +1384,57 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
             let tag = &src[i..=j];
             let ti = parse_tag_info(tag);
 
-            if !noreformat_stack.is_empty() {
+            let has_this_noreformat = tag_has_noreformat_attr(tag);
+            let is_verbatim = open_stack.iter().any(|e| e.has_noreformat) || (!ti.is_end && has_this_noreformat);
+            if is_verbatim {
                 out.extend_from_slice(tag);
             } else {
                 normalize_inside_tag(tag, out);
             }
 
-            // raw-text tracking
-            if is_raw_text(ti.name) {
-                if ti.is_end {
-                    // ignore unmatched closes in non-raw context
-                } else if !ti.self_closing {
-                    raw_stack.push(ti.name.to_ascii_lowercase());
-                }
-            }
-
-            // data-noreformat tracking
+            // open_stack handling
+            let mut name_lower = ti.name.to_vec();
+            name_lower.make_ascii_lowercase();
             if ti.is_end {
-                if let Some(last) = noreformat_stack.last() {
-                    if last.eq_ignore_ascii_case(ti.name) {
-                        noreformat_stack.pop();
+                while let Some(top) = open_stack.last() {
+                    if top.name == name_lower {
+                        open_stack.pop();
+                        break;
+                    } else {
+                        open_stack.pop();
                     }
                 }
-            } else if !ti.self_closing && !is_void(ti.name) && tag_has_noreformat_attr(tag) {
-                noreformat_stack.push(ti.name.to_ascii_lowercase());
+            } else if !ti.self_closing && !is_void(ti.name) {
+                // implied closes
+                if name_lower == b"li" {
+                    if let Some(top) = open_stack.last() {
+                        if top.name == b"li" {
+                            open_stack.pop();
+                        }
+                    }
+                } else if name_lower == b"dt" || name_lower == b"dd" {
+                    if let Some(top) = open_stack.last() {
+                        if top.name == b"dt" || top.name == b"dd" {
+                            open_stack.pop();
+                        }
+                    }
+                } else if matches_ignore_ascii_case(&name_lower, p_closing) {
+                    if let Some(top) = open_stack.last() {
+                        if top.name == b"p" {
+                            open_stack.pop();
+                        }
+                    }
+                }
+
+                open_stack.push(OpenElement {
+                    name: name_lower.clone(),
+                    has_noreformat: has_this_noreformat,
+                });
+            }
+
+            // raw-text tracking
+            if is_raw_text(ti.name) && !ti.is_end && !ti.self_closing {
+                raw_stack.push(name_lower.clone());
             }
 
             // <br> rule
@@ -1406,11 +1450,12 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
             }
 
             // Set after_boundary for structural start tags
-            if !ti.is_end && is_structural(ti.name) && !ti.self_closing {
+            if !ti.is_end && is_structural(&name_lower) {
                 after_boundary = true;
             } else {
                 after_boundary = false;
             }
+
             i = j + 1;
             continue;
         }
@@ -1419,22 +1464,21 @@ fn transform(src: &[u8], out: &mut Vec<u8>, use_markdown: bool) {
         let next_lt = memchr(b'<', &src[i..]).map(|off| i + off).unwrap_or(n);
         let chunk = &src[i..next_lt];
 
-        if !noreformat_stack.is_empty() {
+        let is_verbatim = open_stack.iter().any(|e| e.has_noreformat);
+        if is_verbatim {
             out.extend_from_slice(chunk);
-            i = next_lt;
-            continue;
+        } else {
+            reflow_text_chunk(
+                chunk,
+                src,
+                next_lt,
+                out,
+                use_markdown,
+                after_boundary,
+                after_br,
+                i,
+            );
         }
-
-        reflow_text_chunk(
-            chunk,
-            src,
-            next_lt,
-            out,
-            use_markdown,
-            after_boundary,
-            after_br,
-            i,
-        );
 
         after_boundary = false;
         after_br = false;
